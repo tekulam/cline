@@ -1,0 +1,131 @@
+import * as fs from "fs/promises"
+import * as vscode from "vscode"
+import { ExtensionRegistryInfo } from "@/registry"
+import { CommandContext } from "@/shared/proto/index.cline"
+import { Logger } from "@/services/logging/Logger"
+import { Controller } from "../../core/controller"
+import { WebviewProvider } from "../../core/webview"
+import { convertVscodeDiagnostics } from "./hostbridge/workspace/getDiagnostics"
+
+/**
+ * Finds the notebook cell that contains the selected text and returns its JSON representation
+ * @param filePath Path to the .ipynb file
+ * @param notebookCell The cell index from the active notebook editor
+ * @returns JSON string of the matching cell, or null if no match found
+ */
+async function findMatchingNotebookCell(filePath: string, notebookCell?: number): Promise<string | null> {
+	try {
+		// Read the notebook file directly
+		const notebookContent = await fs.readFile(filePath, "utf8")
+		const notebook = JSON.parse(notebookContent)
+
+		if (!notebook.cells || !Array.isArray(notebook.cells)) {
+			Logger.log("Invalid notebook structure: no cells array found")
+			return null
+		}
+
+		Logger.log(`Loaded notebook with ${notebook.cells.length} cells`)
+
+		if (typeof notebookCell === "number" && notebookCell >= 0 && notebookCell < notebook.cells.length) {
+			Logger.log(`Using provided notebook cell number ${notebookCell}`)
+			// Get a reference to the specific cell object
+			const cellToProcess = notebook.cells[notebookCell]
+
+			// Clear the outputs array before stringifying to ensure clean JSON
+			cellToProcess.outputs = []
+
+			// Stringify the modified cell object with 2-space indentation
+			return JSON.stringify(cellToProcess, null, 2)
+		}
+
+		Logger.log("No valid notebook cell number provided")
+		return null
+	} catch (error) {
+		Logger.error("Error in findMatchingNotebookCell:", error)
+		return null
+	}
+}
+
+/**
+ * Gets the context needed for VSCode commands that interact with the editor
+ * @param range Optional range to use instead of current selection
+ * @param vscodeDiagnostics Optional diagnostics to include
+ * @returns Context object with controller, selected text, file info, and problems
+ */
+export async function getContextForCommand(
+	range?: vscode.Range,
+	vscodeDiagnostics?: vscode.Diagnostic[],
+): Promise<
+	| undefined
+	| {
+			controller: Controller
+			commandContext: CommandContext
+	  }
+> {
+	const activeWebview = await focusChatInput()
+	// Use the controller from the active instance
+	const controller = activeWebview.controller
+
+	const editor = vscode.window.activeTextEditor
+	if (!editor) {
+		return
+	}
+	// Use provided range if available, otherwise use current selection
+	// (vscode command passes an argument in the first param by default, so we need to ensure it's a Range object)
+	const textRange = range instanceof vscode.Range ? range : editor.selection
+	const selectedText = editor.document.getText(textRange)
+
+	const filePath = editor.document.uri.fsPath
+	const language = editor.document.languageId
+	const diagnostics = convertVscodeDiagnostics(vscodeDiagnostics || [])
+	const commandContext: CommandContext = {
+		selectedText,
+		filePath,
+		diagnostics,
+		language,
+	}
+
+	// Enhanced notebook handling for .ipynb files
+	if (filePath.endsWith(".ipynb")) {
+		const enhancedNotebookInteractionEnabled =
+			controller.stateManager.getGlobalSettingsKey("enhancedNotebookInteractionEnabled") ?? false
+
+		Logger.log(`🔍 NOTEBOOK DEBUG: File is .ipynb, enhanced feature enabled: ${enhancedNotebookInteractionEnabled}`)
+
+		if (enhancedNotebookInteractionEnabled) {
+			const activeNotebook = vscode.window.activeNotebookEditor
+
+			try {
+				Logger.log(`📓 Processing notebook file: ${filePath}`)
+				Logger.log(
+					`📍 Selection range: ${textRange.start.line}:${textRange.start.character} to ${textRange.end.line}:${textRange.end.character}`,
+				)
+				Logger.log(`📝 Selected text: "${selectedText.substring(0, 100)}${selectedText.length > 100 ? "..." : ""}"`)
+
+				if (activeNotebook) {
+					const cellIndex = activeNotebook.notebook.cellAt(activeNotebook.selection.start).index
+					const notebookCellJson = await findMatchingNotebookCell(filePath, cellIndex)
+
+					if (notebookCellJson) {
+						commandContext.notebookCellJson = notebookCellJson
+						Logger.log("✅ Successfully added notebook cell JSON to context")
+					} else {
+						Logger.log("❌ No matching cell found")
+					}
+				}
+			} catch (error) {
+				Logger.error("💥 Error processing notebook file:", error)
+				// Continue with regular processing - notebook enhancement is optional
+			}
+		}
+	}
+
+	return { controller, commandContext }
+}
+
+export async function focusChatInput(): Promise<WebviewProvider> {
+	await vscode.commands.executeCommand(ExtensionRegistryInfo.commands.FocusChatInput)
+
+	// At this point, the instance is guaranteed to exist due to the FocusChatInput command
+	return WebviewProvider.getInstance()
+}
